@@ -538,19 +538,14 @@ def main():
         # ── Step 5 : Pre-deletion summary ──────────────────────
         print_pre_deletion_summary(month_label, disk_before, found_stats, not_found_stats)
 
-        # ── Step 6 : Free-space threshold check ────────────────
-        if disk_before["free_gb"] >= FREE_SPACE_THRESHOLD_GB:
-            print(f"\n[OK] Free space ({disk_before['free_gb']:.2f} GB) is above the "
-                  f"threshold ({FREE_SPACE_THRESHOLD_GB} GB).")
-            print("Free space is above threshold. No cleanup required.")
-            return
-
-        print(f"\n[WARNING] Free space ({disk_before['free_gb']:.2f} GB) is below the "
-              f"threshold ({FREE_SPACE_THRESHOLD_GB} GB). Cleanup is recommended.")
-
+        # ── Step 6 : Check if there are Aadhaar Not Found records ────────────────
         if not not_found_records:
             print("\n[INFO] No Aadhaar Not Found records found for this month. Exiting.")
             return
+        
+        print(f"\n[INFO] Aadhaar Not Found records identified for {month_label}.")
+        print(f"Eligible records for cleanup : {len(not_found_records)}")
+        print(f"Storage that can be reclaimed : {bytes_to_gb(not_found_bytes):.4f} GB")
 
         # ── Step 7 : User confirmation ─────────────────────────
         if not prompt_user_confirmation(month_label):

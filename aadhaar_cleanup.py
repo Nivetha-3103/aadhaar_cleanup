@@ -15,7 +15,7 @@ USERNAME = 'ABHIMASK'
 PASSWORD = 'abhiM@4312'
 
 DOCUMENTS_TABLE          = "dbo.documents"
-FILES_TABLE              = "dbo.files"
+FILES_TABLE               = "dbo.files"
 EXTRACTION_DETAILS_TABLE = "dbo.extractionDetails"
 
 # ─────────────────────────────────────────────
@@ -24,7 +24,8 @@ EXTRACTION_DETAILS_TABLE = "dbo.extractionDetails"
 FREE_SPACE_THRESHOLD_GB = 200
 DATA_ROOT_PATH          = "/data"
 
-NOT_FOUND_STATUS_VALUE = "aadhar not found"
+# Only records with this ProcessingStatus are eligible for cleanup.
+TARGET_PROCESSING_STATUS = "Not Applicable"
 
 # Accepted month-name spellings for free-text input, e.g. "January 2026"
 MONTH_NAMES = {
@@ -46,16 +47,17 @@ def bytes_to_gb(num_bytes):
 
 def get_disk_usage(path):
     """
-    Returns disk usage statistics (in GB + free%) for the given path.
-    Keys: total_gb, used_gb, free_gb, free_pct
+    Returns disk usage statistics (in GB + used%/free%) for the given path.
+    Keys: total_gb, used_gb, free_gb, used_pct, free_pct
     """
     usage = shutil.disk_usage(path)
     total = usage.total or 1          # guard against division by zero
     return {
-        "total_gb": bytes_to_gb(usage.total),
-        "used_gb":  bytes_to_gb(usage.used),
-        "free_gb":  bytes_to_gb(usage.free),
-        "free_pct": (usage.free / total) * 100,
+        "total_gb":  bytes_to_gb(usage.total),
+        "used_gb":   bytes_to_gb(usage.used),
+        "free_gb":   bytes_to_gb(usage.free),
+        "used_pct":  (usage.used / total) * 100,
+        "free_pct":  (usage.free / total) * 100,
     }
 
 
@@ -64,10 +66,10 @@ def print_disk_usage(title, usage):
     print(f"\n{'=' * 52}")
     print(f"  {title}")
     print(f"{'=' * 52}")
-    print(f"  Total Disk Size   : {usage['total_gb']:.2f} GB")
-    print(f"  Used Space        : {usage['used_gb']:.2f} GB")
-    print(f"  Free Space        : {usage['free_gb']:.2f} GB")
-    print(f"  Free Space (%)    : {usage['free_pct']:.1f}%")
+    print(f"  Total Storage      : {usage['total_gb']:.2f} GB")
+    print(f"  Used Storage       : {usage['used_gb']:.2f} GB")
+    print(f"  Free Storage       : {usage['free_gb']:.2f} GB")
+    print(f"  Used Percentage    : {usage['used_pct']:.2f}%")
     print(f"{'=' * 52}")
 
 
@@ -193,10 +195,10 @@ def _rows_to_dicts(cursor, rows):
     return [dict(zip(columns, row)) for row in rows]
 
 
-def fetch_records_for_month(cursor, label, start_date, end_date):
+def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
     """
-    Fetches ALL records (both Aadhaar Found and Aadhaar Not Found) where
-    d.UploadDate falls within [start_date, end_date).
+    Fetches records where d.UploadDate falls within [start_date, end_date)
+    AND ed.ProcessingStatus = 'Not Applicable'.
 
     Uses a half-open date-range predicate (>= start / < end) so that SQL
     Server can perform an index seek on documents.UploadDate instead of a
@@ -207,7 +209,7 @@ def fetch_records_for_month(cursor, label, start_date, end_date):
       files.id                = extractionDetails.fileId
 
     Returns a list of dicts with keys:
-        documentindex, upload_date, file_id, file_name, maskingStatus,
+        documentindex, upload_date, file_id, file_name, ProcessingStatus,
         binaryFilePath, extractedFilePath, outputFilePath,
         pickleInputPath, pickleOutputPath
     """
@@ -218,7 +220,7 @@ def fetch_records_for_month(cursor, label, start_date, end_date):
                 d.UploadDate            AS upload_date,
                 f.id                    AS file_id,
                 f.file_name,
-                ed.maskingStatus,
+                ed.ProcessingStatus,
                 ed.binaryFilePath,
                 ed.extractedFilePath,
                 ed.outputFilePath,
@@ -231,36 +233,18 @@ def fetch_records_for_month(cursor, label, start_date, end_date):
                 ON ed.fileId = f.id
             WHERE d.UploadDate >= ?
               AND d.UploadDate <  ?
+              AND ed.ProcessingStatus = ?
         """
-        cursor.execute(query, (start_date, end_date))
+        cursor.execute(query, (start_date, end_date, TARGET_PROCESSING_STATUS))
         rows = cursor.fetchall()
         result = _rows_to_dicts(cursor, rows)
         print(f"  [DB] {len(result)} record(s) found for {label} "
-              f"(UploadDate >= '{start_date}' AND < '{end_date}').")
+              f"(UploadDate >= '{start_date}' AND < '{end_date}', "
+              f"ProcessingStatus = '{TARGET_PROCESSING_STATUS}').")
         return result
     except pyodbc.Error as ex:
-        print(f"  [DB ERROR] fetch_records_for_month({label}): {ex}")
+        print(f"  [DB ERROR] fetch_eligible_records_for_month({label}): {ex}")
         return []
-
-
-def split_records_by_status(records):
-    """
-    Splits records into (found_records, not_found_records) based on
-    maskingStatus. Only records whose maskingStatus is exactly
-    'Aadhar not found' (case-insensitive, trimmed) go into the
-    not-found bucket; everything else is treated as Aadhaar Found.
-    """
-    found_records = []
-    not_found_records = []
-
-    for record in records:
-        status = (record.get("maskingStatus") or "").strip().lower()
-        if status == NOT_FOUND_STATUS_VALUE:
-            not_found_records.append(record)
-        else:
-            found_records.append(record)
-
-    return found_records, not_found_records
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -324,36 +308,27 @@ def calculate_storage_for_records(records):
 #  REPORTING
 # ═══════════════════════════════════════════════════════════════
 
-def print_pre_deletion_summary(month_label, disk_before, found_stats, not_found_stats):
+def print_pre_deletion_summary(month_label, disk_before, eligible_stats):
     """
     Prints the combined pre-deletion summary: current server storage,
-    selected month, and the Aadhaar Found / Aadhaar Not Found breakdown.
+    selected month, and the ProcessingStatus = 'Not Applicable' breakdown.
 
-    found_stats / not_found_stats are dicts with keys:
+    eligible_stats is a dict with keys:
         record_count, existing_paths, total_bytes, missing_count
     """
-    print("\n" + "=" * 52)
-    print("  CURRENT SERVER STORAGE")
-    print("=" * 52)
-    print(f"  Total Disk Size      : {disk_before['total_gb']:.2f} GB")
-    print(f"  Used Space           : {disk_before['used_gb']:.2f} GB")
-    print(f"  Free Space           : {disk_before['free_gb']:.2f} GB")
-    print(f"  Free Space (%)       : {disk_before['free_pct']:.1f} %")
+    print("\nCurrent Server Storage")
+    print("-" * 23)
+    print(f"Total Storage      : {disk_before['total_gb']:.2f} GB")
+    print(f"Used Storage       : {disk_before['used_gb']:.2f} GB")
+    print(f"Free Storage       : {disk_before['free_gb']:.2f} GB")
+    print(f"Used Percentage    : {disk_before['used_pct']:.2f}%")
 
-    print(f"\n  Selected Month       : {month_label}")
+    print(f"\nProcessing Status : {TARGET_PROCESSING_STATUS}")
 
-    print("\n  --- Aadhaar Found ---")
-    print(f"  Record Count         : {found_stats['record_count']}")
-    print(f"  Existing Files       : {len(found_stats['existing_paths'])}")
-    print(f"  Missing Files        : {found_stats['missing_count']}")
-    print(f"  Storage Occupied     : {bytes_to_gb(found_stats['total_bytes']):.4f} GB")
-
-    print("\n  --- Aadhaar Not Found ---")
-    print(f"  Record Count         : {not_found_stats['record_count']}")
-    print(f"  Existing Files       : {len(not_found_stats['existing_paths'])}")
-    print(f"  Missing Files        : {not_found_stats['missing_count']}")
-    print(f"  Storage Occupied     : {bytes_to_gb(not_found_stats['total_bytes']):.4f} GB")
-    print("=" * 52)
+    print(f"\nRecords Found      : {eligible_stats['record_count']}")
+    print(f"Existing Files     : {len(eligible_stats['existing_paths'])}")
+    print(f"Missing Files      : {eligible_stats['missing_count']}")
+    print(f"Storage Occupied   : {bytes_to_gb(eligible_stats['total_bytes']):.4f} GB")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -390,7 +365,8 @@ def perform_cleanup(records):
     """
     Deletes every extraction file referenced across `records`,
     de-duplicating so the same physical path is never touched twice.
-    Intended to be called ONLY with Aadhaar Not Found records.
+    Intended to be called ONLY with ProcessingStatus = 'Not Applicable'
+    records.
 
     Returns a stats dict.
     """
@@ -403,7 +379,7 @@ def perform_cleanup(records):
     deleted_paths = set()
 
     print(f"\n--- Starting Deletion: {len(records)} eligible record(s) "
-          f"(Aadhaar Not Found only) ---")
+          f"(ProcessingStatus = '{TARGET_PROCESSING_STATUS}' only) ---")
 
     for record in records:
         file_id   = record.get("file_id")
@@ -433,12 +409,13 @@ def perform_cleanup(records):
 #  USER CONFIRMATION
 # ═══════════════════════════════════════════════════════════════
 
-def prompt_user_confirmation(month_label):
+def prompt_user_confirmation():
     """
-    Asks the user whether to delete Aadhaar Not Found files for the
-    selected month. Returns True only on explicit 'yes'.
+    Asks the user whether to delete files belonging to
+    ProcessingStatus = 'Not Applicable'. Returns True only on explicit 'yes'.
     """
-    print(f"\nDo you want to delete Aadhaar Not Found files for {month_label}? (yes/no): ",
+    print(f"\nDo you want to delete all files belonging to "
+          f"ProcessingStatus = '{TARGET_PROCESSING_STATUS}'? (yes/no): ",
           end="", flush=True)
     while True:
         try:
@@ -468,23 +445,26 @@ def print_final_report(month_label, records_processed, stats, disk_before, disk_
     print("  CLEANUP COMPLETED")
     print("=" * 52)
     print(f"  Selected Month       : {month_label}")
+    print(f"  Processing Status    : {TARGET_PROCESSING_STATUS}")
     print(f"\n  Records Processed    : {records_processed}")
     print(f"  Files Deleted        : {stats['deleted']}")
     print(f"  Files Not Found      : {stats['not_found']}")
-    print(f"  Deletion Failures    : {stats['errors']}")
-    print(f"\n  Storage Deleted      : {deleted_gb:.4f} GB")
+    print(f"  Errors               : {stats['errors']}")
+    print(f"\n  Total Storage Deleted: {deleted_gb:.4f} GB")
 
     print(f"\n  --- Disk Usage Before ---")
-    print(f"  Total Space          : {disk_before['total_gb']:.2f} GB")
-    print(f"  Used Space           : {disk_before['used_gb']:.2f} GB")
-    print(f"  Free Space           : {disk_before['free_gb']:.2f} GB")
-    print(f"  Free Percentage      : {disk_before['free_pct']:.1f} %")
+    print(f"  Total Storage        : {disk_before['total_gb']:.2f} GB")
+    print(f"  Used Storage         : {disk_before['used_gb']:.2f} GB")
+    print(f"  Free Storage         : {disk_before['free_gb']:.2f} GB")
+    print(f"  Used Percentage      : {disk_before['used_pct']:.2f}%")
+    print(f"  Free Percentage      : {disk_before['free_pct']:.2f}%")
 
     print(f"\n  --- Disk Usage After ---")
-    print(f"  Total Space          : {disk_after['total_gb']:.2f} GB")
-    print(f"  Used Space           : {disk_after['used_gb']:.2f} GB")
-    print(f"  Free Space           : {disk_after['free_gb']:.2f} GB")
-    print(f"  Free Percentage      : {disk_after['free_pct']:.1f} %")
+    print(f"  Total Storage        : {disk_after['total_gb']:.2f} GB")
+    print(f"  Used Storage         : {disk_after['used_gb']:.2f} GB")
+    print(f"  Free Storage         : {disk_after['free_gb']:.2f} GB")
+    print(f"  Used Percentage      : {disk_after['used_pct']:.2f}%")
+    print(f"  Free Percentage      : {disk_after['free_pct']:.2f}%")
 
     print(f"\n  Net Space Reclaimed  : {net_reclaimed_gb:.4f} GB")
     print("=" * 52)
@@ -514,52 +494,46 @@ def main():
     try:
         cursor = conn.cursor()
 
-        # ── Step 4 : Fetch & classify records for selected month ──
-        print(f"\n[INFO] Querying database for records in {month_label}...")
-        all_records = fetch_records_for_month(cursor, month_label, start_date, end_date)
-        found_records, not_found_records = split_records_by_status(all_records)
+        # ── Step 4 : Fetch eligible records for selected month ──
+        print(f"\n[INFO] Querying database for records in {month_label} "
+              f"with ProcessingStatus = '{TARGET_PROCESSING_STATUS}'...")
+        eligible_records = fetch_eligible_records_for_month(
+            cursor, month_label, start_date, end_date
+        )
 
-        found_existing, found_bytes, found_missing = calculate_storage_for_records(found_records)
-        not_found_existing, not_found_bytes, not_found_missing = calculate_storage_for_records(not_found_records)
+        eligible_existing, eligible_bytes, eligible_missing = calculate_storage_for_records(
+            eligible_records
+        )
 
-        found_stats = {
-            "record_count":   len(found_records),
-            "existing_paths": found_existing,
-            "total_bytes":    found_bytes,
-            "missing_count":  found_missing,
-        }
-        not_found_stats = {
-            "record_count":   len(not_found_records),
-            "existing_paths": not_found_existing,
-            "total_bytes":    not_found_bytes,
-            "missing_count":  not_found_missing,
+        eligible_stats = {
+            "record_count":   len(eligible_records),
+            "existing_paths": eligible_existing,
+            "total_bytes":    eligible_bytes,
+            "missing_count":  eligible_missing,
         }
 
         # ── Step 5 : Pre-deletion summary ──────────────────────
-        print_pre_deletion_summary(month_label, disk_before, found_stats, not_found_stats)
+        print_pre_deletion_summary(month_label, disk_before, eligible_stats)
 
-        # ── Step 6 : Check if there are Aadhaar Not Found records ────────────────
-        if not not_found_records:
-            print("\n[INFO] No Aadhaar Not Found records found for this month. Exiting.")
+        # ── Step 6 : Check if there are eligible records ───────
+        if not eligible_records:
+            print(f"\n[INFO] No records with ProcessingStatus = "
+                  f"'{TARGET_PROCESSING_STATUS}' found for this month. Exiting.")
             return
-        
-        print(f"\n[INFO] Aadhaar Not Found records identified for {month_label}.")
-        print(f"Eligible records for cleanup : {len(not_found_records)}")
-        print(f"Storage that can be reclaimed : {bytes_to_gb(not_found_bytes):.4f} GB")
 
         # ── Step 7 : User confirmation ─────────────────────────
-        if not prompt_user_confirmation(month_label):
+        if not prompt_user_confirmation():
             print("\n[INFO] Deletion cancelled by user. No files were deleted.")
             return
 
-        # ── Step 8 : Perform cleanup (Not Found only) ──────────
-        stats = perform_cleanup(not_found_records)
+        # ── Step 8 : Perform cleanup ────────────────────────────
+        stats = perform_cleanup(eligible_records)
 
         # ── Step 9 : Final report ──────────────────────────────
         disk_after = get_disk_usage(DATA_ROOT_PATH)
         print_final_report(
             month_label=month_label,
-            records_processed=len(not_found_records),
+            records_processed=len(eligible_records),
             stats=stats,
             disk_before=disk_before,
             disk_after=disk_after,

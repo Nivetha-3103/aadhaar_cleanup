@@ -15,7 +15,6 @@ USERNAME = 'ABHIMASK'
 PASSWORD = 'abhiM@4312'
 
 DOCUMENTS_TABLE          = "dbo.documents"
-FILES_TABLE               = "dbo.files"
 EXTRACTION_DETAILS_TABLE = "dbo.extractionDetails"
 
 # ─────────────────────────────────────────────
@@ -25,7 +24,7 @@ FREE_SPACE_THRESHOLD_GB = 200
 DATA_ROOT_PATH          = "/data"
 
 # Records with either of these ProcessingStatus values are eligible for cleanup.
-TARGET_PROCESSING_STATUSES = ("Not Applicable", "Aadhaar not found")
+TARGET_PROCESSING_STATUSES = ("Not Applicable", "Aadhaar Not Found")
 
 # Accepted month-name spellings for free-text input, e.g. "January 2026"
 MONTH_NAMES = {
@@ -198,15 +197,16 @@ def _rows_to_dicts(cursor, rows):
 def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
     """
     Fetches records where d.UploadDate falls within [start_date, end_date)
-    AND ed.processingStatus IN ('Not Applicable', 'Aadhaar not found').
+    AND ed.processingStatus IN ('Not Applicable', 'Aadhaar Not Found').
 
     Uses a half-open date-range predicate (>= start / < end) so that SQL
     Server can perform an index seek on documents.UploadDate instead of a
     full table scan (avoids YEAR()/MONTH() function wrapping).
 
-    Join chain: documents → files → extractionDetails
-      documents.documentindex = files.documentindex
-      files.id                = extractionDetails.fileId
+    Join chain: documents → extractionDetails (no files table needed,
+    since extractionDetails already carries fileId and the extraction
+    file paths directly)
+      documents.documentindex = extractionDetails.id
 
     Returns a list of dicts with keys:
         documentindex, upload_date, file_id, file_name, processingStatus,
@@ -217,29 +217,28 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
         query = f"""
             SELECT
                 d.documentindex,
-                d.UploadDate            AS upload_date,
-                f.id                    AS file_id,
-                f.file_name,
+                d.UploadDate                AS upload_date,
+                ed.fileId                   AS file_id,
+                ed.orginalFileName           AS file_name,
                 ed.processingStatus,
                 ed.extractedFilePath,
                 ed.pickleInputPath,
                 ed.pickleOutputPath,
                 ed.outputFilePrepration
             FROM {DOCUMENTS_TABLE} d
-            INNER JOIN {FILES_TABLE} f
-                ON d.documentindex = f.documentindex
             INNER JOIN {EXTRACTION_DETAILS_TABLE} ed
-                ON ed.fileId = f.id
+                ON d.documentindex = ed.id
             WHERE d.UploadDate >= ?
               AND d.UploadDate <  ?
-              AND ed.processingStatus IN ('Not Applicable', 'Aadhaar not found')
+              AND ed.processingStatus IN ('Not Applicable', 'Aadhaar Not Found')
         """
         cursor.execute(query, (start_date, end_date))
         rows = cursor.fetchall()
         result = _rows_to_dicts(cursor, rows)
         print(f"  [DB] {len(result)} record(s) found for {label} "
               f"(UploadDate >= '{start_date}' AND < '{end_date}', "
-              f"processingStatus IN {TARGET_PROCESSING_STATUSES}).")
+              f"processingStatus IN {TARGET_PROCESSING_STATUSES}, "
+              f"joined on documents.documentindex = extractionDetails.id).")
         return result
     except pyodbc.Error as ex:
         print(f"  [DB ERROR] fetch_eligible_records_for_month({label}): {ex}")
@@ -249,7 +248,7 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
 def split_records_by_status(records):
     """
     Splits a combined list of records into a dict keyed by processingStatus,
-    e.g. {"Not Applicable": [...], "Aadhaar not found": [...]}.
+    e.g. {"Not Applicable": [...], "Aadhaar Not Found": [...]}.
     Any status outside TARGET_PROCESSING_STATUSES is ignored (should not
     occur given the query filter, but guards against unexpected data).
     """
@@ -324,7 +323,7 @@ def calculate_storage_for_records(records):
 def print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, overall_stats):
     """
     Prints the combined pre-deletion summary ONCE: current server storage,
-    selected month, per-status breakdown (Not Applicable / Aadhaar not found),
+    selected month, per-status breakdown (Not Applicable / Aadhaar Not Found),
     and an overall total.
 
     na_stats / anf_stats / overall_stats are dicts with keys:
@@ -345,7 +344,7 @@ def print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, ov
     print(f"Record Count       : {na_stats['record_count']}")
     print(f"Storage Occupied   : {bytes_to_gb(na_stats['total_bytes']):.2f} GB")
 
-    print("\nAadhaar not found")
+    print("\nAadhaar Not Found")
     print("-" * 26)
     print(f"Record Count       : {anf_stats['record_count']}")
     print(f"Storage Occupied   : {bytes_to_gb(anf_stats['total_bytes']):.2f} GB")
@@ -392,7 +391,7 @@ def perform_cleanup(records):
     Deletes every extraction file referenced across `records`,
     de-duplicating so the same physical path is never touched twice.
     Intended to be called ONLY with records whose ProcessingStatus is
-    'Not Applicable' or 'Aadhaar not found'.
+    'Not Applicable' or 'Aadhaar Not Found'.
 
     Returns a stats dict.
     """
@@ -528,7 +527,7 @@ def main():
         # ── Step 5 : Split by status & calculate storage per status ──
         records_by_status = split_records_by_status(eligible_records)
         na_records  = records_by_status["Not Applicable"]
-        anf_records = records_by_status["Aadhaar not found"]
+        anf_records = records_by_status["Aadhaar Not Found"]
 
         na_existing, na_bytes, na_missing = calculate_storage_for_records(na_records)
         anf_existing, anf_bytes, anf_missing = calculate_storage_for_records(anf_records)

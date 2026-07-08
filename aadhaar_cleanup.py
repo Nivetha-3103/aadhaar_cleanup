@@ -509,6 +509,7 @@ def main():
     month_label, start_date, end_date = prompt_for_month()
 
     # ── Step 3 : Connect to DB ──────────────────────────────────
+    print(f"\n[INFO] Fetching from DB: {DATABASE}")
     conn = connect_to_db()
     if not conn:
         return

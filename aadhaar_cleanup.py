@@ -15,6 +15,7 @@ USERNAME = 'ABHIMASK'
 PASSWORD = 'abhiM@4312'
 
 DOCUMENTS_TABLE          = "dbo.documents"
+FILES_TABLE              = "dbo.files"
 EXTRACTION_DETAILS_TABLE = "dbo.extractionDetails"
 
 # ─────────────────────────────────────────────
@@ -203,10 +204,9 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
     Server can perform an index seek on documents.UploadDate instead of a
     full table scan (avoids YEAR()/MONTH() function wrapping).
 
-    Join chain: documents → extractionDetails (no files table needed,
-    since extractionDetails already carries fileId and the extraction
-    file paths directly)
-      documents.documentindex = extractionDetails.id
+    Join chain: documents → files → extractionDetails
+      documents.documentindex = files.documentindex
+      files.id                = extractionDetails.fileId
 
     Returns a list of dicts with keys:
         documentindex, upload_date, file_id, file_name, processingStatus,
@@ -226,8 +226,10 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
                 ed.pickleOutputPath,
                 ed.outputFilePrepration
             FROM {DOCUMENTS_TABLE} d
+            INNER JOIN {FILES_TABLE} f
+                ON d.documentindex = f.documentindex
             INNER JOIN {EXTRACTION_DETAILS_TABLE} ed
-                ON d.documentindex = ed.id
+                ON f.id = ed.fileId
             WHERE d.UploadDate >= ?
               AND d.UploadDate <  ?
               AND ed.processingStatus IN ('Not Applicable', 'Aadhaar Not Found')
@@ -238,7 +240,7 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
         print(f"  [DB] {len(result)} record(s) found for {label} "
               f"(UploadDate >= '{start_date}' AND < '{end_date}', "
               f"processingStatus IN {TARGET_PROCESSING_STATUSES}, "
-              f"joined on documents.documentindex = extractionDetails.id).")
+              f"joined via documents -> files -> extractionDetails).")
         return result
     except pyodbc.Error as ex:
         print(f"  [DB ERROR] fetch_eligible_records_for_month({label}): {ex}")

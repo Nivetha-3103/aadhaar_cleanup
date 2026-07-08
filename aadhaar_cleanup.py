@@ -24,8 +24,8 @@ EXTRACTION_DETAILS_TABLE = "dbo.extractionDetails"
 FREE_SPACE_THRESHOLD_GB = 200
 DATA_ROOT_PATH          = "/data"
 
-# Only records with this ProcessingStatus are eligible for cleanup.
-TARGET_PROCESSING_STATUS = "Not Applicable"
+# Records with either of these ProcessingStatus values are eligible for cleanup.
+TARGET_PROCESSING_STATUSES = ("Not Applicable", "Aadhaar not found")
 
 # Accepted month-name spellings for free-text input, e.g. "January 2026"
 MONTH_NAMES = {
@@ -198,7 +198,7 @@ def _rows_to_dicts(cursor, rows):
 def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
     """
     Fetches records where d.UploadDate falls within [start_date, end_date)
-    AND ed.ProcessingStatus = 'Not Applicable'.
+    AND ed.processingStatus IN ('Not Applicable', 'Aadhaar not found').
 
     Uses a half-open date-range predicate (>= start / < end) so that SQL
     Server can perform an index seek on documents.UploadDate instead of a
@@ -209,9 +209,9 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
       files.id                = extractionDetails.fileId
 
     Returns a list of dicts with keys:
-        documentindex, upload_date, file_id, file_name, ProcessingStatus,
-        binaryFilePath, extractedFilePath, outputFilePath,
-        pickleInputPath, pickleOutputPath
+        documentindex, upload_date, file_id, file_name, processingStatus,
+        extractedFilePath, pickleInputPath, pickleOutputPath,
+        outputFilePrepration
     """
     try:
         query = f"""
@@ -220,12 +220,11 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
                 d.UploadDate            AS upload_date,
                 f.id                    AS file_id,
                 f.file_name,
-                ed.ProcessingStatus,
-                ed.binaryFilePath,
+                ed.processingStatus,
                 ed.extractedFilePath,
-                ed.outputFilePath,
                 ed.pickleInputPath,
-                ed.pickleOutputPath
+                ed.pickleOutputPath,
+                ed.outputFilePrepration
             FROM {DOCUMENTS_TABLE} d
             INNER JOIN {FILES_TABLE} f
                 ON d.documentindex = f.documentindex
@@ -233,31 +232,45 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
                 ON ed.fileId = f.id
             WHERE d.UploadDate >= ?
               AND d.UploadDate <  ?
-              AND ed.ProcessingStatus = ?
+              AND ed.processingStatus IN ('Not Applicable', 'Aadhaar not found')
         """
-        cursor.execute(query, (start_date, end_date, TARGET_PROCESSING_STATUS))
+        cursor.execute(query, (start_date, end_date))
         rows = cursor.fetchall()
         result = _rows_to_dicts(cursor, rows)
         print(f"  [DB] {len(result)} record(s) found for {label} "
               f"(UploadDate >= '{start_date}' AND < '{end_date}', "
-              f"ProcessingStatus = '{TARGET_PROCESSING_STATUS}').")
+              f"processingStatus IN {TARGET_PROCESSING_STATUSES}).")
         return result
     except pyodbc.Error as ex:
         print(f"  [DB ERROR] fetch_eligible_records_for_month({label}): {ex}")
         return []
 
 
+def split_records_by_status(records):
+    """
+    Splits a combined list of records into a dict keyed by processingStatus,
+    e.g. {"Not Applicable": [...], "Aadhaar not found": [...]}.
+    Any status outside TARGET_PROCESSING_STATUSES is ignored (should not
+    occur given the query filter, but guards against unexpected data).
+    """
+    grouped = {status: [] for status in TARGET_PROCESSING_STATUSES}
+    for record in records:
+        status = record.get("processingStatus")
+        if status in grouped:
+            grouped[status].append(record)
+    return grouped
+
+
 # ═══════════════════════════════════════════════════════════════
 #  FILE-PATH HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-# Only the five extraction paths are targeted for deletion / size calc.
+# Only these four extraction paths are targeted for deletion / size calc.
 EXTRACTION_PATH_FIELDS = [
-    ("binaryFilePath",    "binary file"),
-    ("extractedFilePath", "extracted file"),
-    ("outputFilePath",    "masked output file"),
-    ("pickleInputPath",   "pickle input file"),
-    ("pickleOutputPath",  "pickle output file"),
+    ("extractedFilePath",    "extracted file"),
+    ("pickleInputPath",      "pickle input file"),
+    ("pickleOutputPath",     "pickle output file"),
+    ("outputFilePrepration", "output file prepration"),
 ]
 
 
@@ -308,27 +321,40 @@ def calculate_storage_for_records(records):
 #  REPORTING
 # ═══════════════════════════════════════════════════════════════
 
-def print_pre_deletion_summary(month_label, disk_before, eligible_stats):
+def print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, overall_stats):
     """
-    Prints the combined pre-deletion summary: current server storage,
-    selected month, and the ProcessingStatus = 'Not Applicable' breakdown.
+    Prints the combined pre-deletion summary ONCE: current server storage,
+    selected month, per-status breakdown (Not Applicable / Aadhaar not found),
+    and an overall total.
 
-    eligible_stats is a dict with keys:
+    na_stats / anf_stats / overall_stats are dicts with keys:
         record_count, existing_paths, total_bytes, missing_count
     """
-    print("\nCurrent Server Storage")
-    print("-" * 23)
+    print("\n" + "=" * 50)
+    print("Current Server Storage")
+    print("-" * 50)
     print(f"Total Storage      : {disk_before['total_gb']:.2f} GB")
     print(f"Used Storage       : {disk_before['used_gb']:.2f} GB")
     print(f"Free Storage       : {disk_before['free_gb']:.2f} GB")
-    print(f"Used Percentage    : {disk_before['used_pct']:.2f}%")
+    print(f"Used Percentage    : {disk_before['used_pct']:.2f} %")
 
-    print(f"\nProcessing Status : {TARGET_PROCESSING_STATUS}")
+    print(f"\nSelected Month     : {month_label}")
 
-    print(f"\nRecords Found      : {eligible_stats['record_count']}")
-    print(f"Existing Files     : {len(eligible_stats['existing_paths'])}")
-    print(f"Missing Files      : {eligible_stats['missing_count']}")
-    print(f"Storage Occupied   : {bytes_to_gb(eligible_stats['total_bytes']):.4f} GB")
+    print("\nNot Applicable")
+    print("-" * 26)
+    print(f"Record Count       : {na_stats['record_count']}")
+    print(f"Storage Occupied   : {bytes_to_gb(na_stats['total_bytes']):.2f} GB")
+
+    print("\nAadhaar not found")
+    print("-" * 26)
+    print(f"Record Count       : {anf_stats['record_count']}")
+    print(f"Storage Occupied   : {bytes_to_gb(anf_stats['total_bytes']):.2f} GB")
+
+    print("\nOverall")
+    print("-" * 26)
+    print(f"Total Records      : {overall_stats['record_count']}")
+    print(f"Total Storage      : {bytes_to_gb(overall_stats['total_bytes']):.2f} GB")
+    print("=" * 50)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -365,8 +391,8 @@ def perform_cleanup(records):
     """
     Deletes every extraction file referenced across `records`,
     de-duplicating so the same physical path is never touched twice.
-    Intended to be called ONLY with ProcessingStatus = 'Not Applicable'
-    records.
+    Intended to be called ONLY with records whose ProcessingStatus is
+    'Not Applicable' or 'Aadhaar not found'.
 
     Returns a stats dict.
     """
@@ -379,7 +405,7 @@ def perform_cleanup(records):
     deleted_paths = set()
 
     print(f"\n--- Starting Deletion: {len(records)} eligible record(s) "
-          f"(ProcessingStatus = '{TARGET_PROCESSING_STATUS}' only) ---")
+          f"(processingStatus IN {TARGET_PROCESSING_STATUSES}) ---")
 
     for record in records:
         file_id   = record.get("file_id")
@@ -411,12 +437,10 @@ def perform_cleanup(records):
 
 def prompt_user_confirmation():
     """
-    Asks the user whether to delete files belonging to
-    ProcessingStatus = 'Not Applicable'. Returns True only on explicit 'yes'.
+    Asks the user whether to delete files belonging to both eligible
+    ProcessingStatus values. Returns True only on explicit 'yes'.
     """
-    print(f"\nDo you want to delete all files belonging to "
-          f"ProcessingStatus = '{TARGET_PROCESSING_STATUS}'? (yes/no): ",
-          end="", flush=True)
+    print("\nDo you want to delete these files? (yes/no): ", end="", flush=True)
     while True:
         try:
             answer = input().strip().lower()
@@ -445,7 +469,7 @@ def print_final_report(month_label, records_processed, stats, disk_before, disk_
     print("  CLEANUP COMPLETED")
     print("=" * 52)
     print(f"  Selected Month       : {month_label}")
-    print(f"  Processing Status    : {TARGET_PROCESSING_STATUS}")
+    print(f"  Processing Statuses  : {', '.join(TARGET_PROCESSING_STATUSES)}")
     print(f"\n  Records Processed    : {records_processed}")
     print(f"  Files Deleted        : {stats['deleted']}")
     print(f"  Files Not Found      : {stats['not_found']}")
@@ -477,10 +501,9 @@ def print_final_report(month_label, records_processed, stats, disk_before, disk_
 def main():
     """Main orchestration for the Aadhaar storage cleanup process."""
 
-    # ── Step 1 : Disk usage snapshot ───────────────────────────
-    print("\n[INFO] Gathering disk usage information...")
+    # ── Step 1 : Disk usage snapshot (not printed here — it is shown
+    #            once as part of the pre-deletion summary below) ────
     disk_before = get_disk_usage(DATA_ROOT_PATH)
-    print_disk_usage(f"Disk Usage for '{DATA_ROOT_PATH}'", disk_before)
 
     # ── Step 2 : Prompt for target month ───────────────────────
     month_label, start_date, end_date = prompt_for_month()
@@ -496,40 +519,59 @@ def main():
 
         # ── Step 4 : Fetch eligible records for selected month ──
         print(f"\n[INFO] Querying database for records in {month_label} "
-              f"with ProcessingStatus = '{TARGET_PROCESSING_STATUS}'...")
+              f"with processingStatus IN {TARGET_PROCESSING_STATUSES}...")
         eligible_records = fetch_eligible_records_for_month(
             cursor, month_label, start_date, end_date
         )
 
-        eligible_existing, eligible_bytes, eligible_missing = calculate_storage_for_records(
+        # ── Step 5 : Split by status & calculate storage per status ──
+        records_by_status = split_records_by_status(eligible_records)
+        na_records  = records_by_status["Not Applicable"]
+        anf_records = records_by_status["Aadhaar not found"]
+
+        na_existing, na_bytes, na_missing = calculate_storage_for_records(na_records)
+        anf_existing, anf_bytes, anf_missing = calculate_storage_for_records(anf_records)
+        overall_existing, overall_bytes, overall_missing = calculate_storage_for_records(
             eligible_records
         )
 
-        eligible_stats = {
+        na_stats = {
+            "record_count":   len(na_records),
+            "existing_paths": na_existing,
+            "total_bytes":    na_bytes,
+            "missing_count":  na_missing,
+        }
+        anf_stats = {
+            "record_count":   len(anf_records),
+            "existing_paths": anf_existing,
+            "total_bytes":    anf_bytes,
+            "missing_count":  anf_missing,
+        }
+        overall_stats = {
             "record_count":   len(eligible_records),
-            "existing_paths": eligible_existing,
-            "total_bytes":    eligible_bytes,
-            "missing_count":  eligible_missing,
+            "existing_paths": overall_existing,
+            "total_bytes":    overall_bytes,
+            "missing_count":  overall_missing,
         }
 
-        # ── Step 5 : Pre-deletion summary ──────────────────────
-        print_pre_deletion_summary(month_label, disk_before, eligible_stats)
+        # ── Step 6 : Pre-deletion summary (shown only once) ───
+        print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, overall_stats)
 
-        # ── Step 6 : Check if there are eligible records ───────
+        # ── Step 7 : Check if there are eligible records ───────
         if not eligible_records:
-            print(f"\n[INFO] No records with ProcessingStatus = "
-                  f"'{TARGET_PROCESSING_STATUS}' found for this month. Exiting.")
+            print(f"\n[INFO] No records with processingStatus IN "
+                  f"{TARGET_PROCESSING_STATUSES} found for this month. Exiting.")
             return
 
-        # ── Step 7 : User confirmation ─────────────────────────
+        # ── Step 8 : User confirmation ─────────────────────────
         if not prompt_user_confirmation():
             print("\n[INFO] Deletion cancelled by user. No files were deleted.")
             return
 
-        # ── Step 8 : Perform cleanup ────────────────────────────
+        # ── Step 9 : Perform cleanup ────────────────────────────
         stats = perform_cleanup(eligible_records)
 
-        # ── Step 9 : Final report ──────────────────────────────
+        # ── Step 10 : Final report ──────────────────────────────
         disk_after = get_disk_usage(DATA_ROOT_PATH)
         print_final_report(
             month_label=month_label,

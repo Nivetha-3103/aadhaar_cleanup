@@ -1,153 +1,85 @@
 import os
-import re
 import shutil
-import calendar
 import traceback
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 import pyodbc
 
 # ─────────────────────────────────────────────
 #  CONNECTION CONSTANTS
 # ─────────────────────────────────────────────
-SERVER   = '10.21.42.17,1433'
-DATABASE = 'abhi_mask'
-USERNAME = 'ABHIMASK'
-PASSWORD = 'abhiM@4312'
+SERVER: str = '10.21.42.17,7865'
+DATABASE: str = 'abhi_mask'
+USERNAME: str = 'ABHIMASK'
+PASSWORD: str = 'abhiM@4312'
 
-DOCUMENTS_TABLE          = "dbo.documents"
-FILES_TABLE              = "dbo.files"
-EXTRACTION_DETAILS_TABLE = "dbo.extractionDetails"
+DOCUMENTS_TABLE: str = "dbo.documents"
+FILES_TABLE: str = "dbo.files"
+EXTRACTION_DETAILS_TABLE: str = "dbo.extractionDetails"
 
 # ─────────────────────────────────────────────
 #  OPERATIONAL CONSTANTS
 # ─────────────────────────────────────────────
-FREE_SPACE_THRESHOLD_GB = 200
-DATA_ROOT_PATH          = "/data"
+DATA_ROOT_PATH: str = "/data"
 
 # Records with either of these ProcessingStatus values are eligible for cleanup.
-TARGET_PROCESSING_STATUSES = ("Not Applicable", "Aadhaar Not Found")
+TARGET_PROCESSING_STATUSES: Tuple[str, str] = ("Not Applicable", "Aadhaar Not Found")
 
-# Accepted month-name spellings for free-text input, e.g. "January 2026"
-MONTH_NAMES = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
-    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
-}
+DATE_INPUT_FORMAT: str = "%Y-%m-%d"
 
 
 # ═══════════════════════════════════════════════════════════════
 #  DISK UTILITIES
 # ═══════════════════════════════════════════════════════════════
 
-def bytes_to_gb(num_bytes):
+def bytes_to_gb(num_bytes: float) -> float:
     """Convert a byte count to GB (base-1024)."""
     return num_bytes / (1024 ** 3)
 
 
-def get_disk_usage(path):
+def get_disk_usage(path: str) -> Dict[str, float]:
     """
     Returns disk usage statistics (in GB + used%/free%) for the given path.
     Keys: total_gb, used_gb, free_gb, used_pct, free_pct
     """
     usage = shutil.disk_usage(path)
-    total = usage.total or 1          # guard against division by zero
+    total = usage.total or 1  # guard against division by zero
     return {
-        "total_gb":  bytes_to_gb(usage.total),
-        "used_gb":   bytes_to_gb(usage.used),
-        "free_gb":   bytes_to_gb(usage.free),
-        "used_pct":  (usage.used / total) * 100,
-        "free_pct":  (usage.free / total) * 100,
+        "total_gb": bytes_to_gb(usage.total),
+        "used_gb": bytes_to_gb(usage.used),
+        "free_gb": bytes_to_gb(usage.free),
+        "used_pct": (usage.used / total) * 100,
+        "free_pct": (usage.free / total) * 100,
     }
 
 
-def print_disk_usage(title, usage):
-    """Pretty-prints a disk usage dict produced by get_disk_usage()."""
-    print(f"\n{'=' * 52}")
-    print(f"  {title}")
-    print(f"{'=' * 52}")
-    print(f"  Total Storage      : {usage['total_gb']:.2f} GB")
-    print(f"  Used Storage       : {usage['used_gb']:.2f} GB")
-    print(f"  Free Storage       : {usage['free_gb']:.2f} GB")
-    print(f"  Used Percentage    : {usage['used_pct']:.2f}%")
-    print(f"{'=' * 52}")
-
-
 # ═══════════════════════════════════════════════════════════════
-#  MONTH INPUT / PARSING
+#  DATE INPUT / PARSING
 # ═══════════════════════════════════════════════════════════════
 
-def parse_month_input(raw_input):
+def parse_date_input(raw_input: str) -> datetime:
     """
-    Parses a user-supplied month/year string into (label, start_date, end_date).
-
-    Accepted formats (case-insensitive):
-        "January 2026"   "Jan 2026"
-        "2026-01"
-        "01-2026"        "01/2026"
-
-    start_date / end_date are returned as SQL Server compatible strings
-    ('YYYY-MM-DD HH:MM:SS.fff') so the caller can use a half-open
-    date-range predicate (>= start AND < end) that stays index-friendly
-    (no YEAR()/MONTH() wrapping).
+    Parses a user-supplied date string in strict 'YYYY-MM-DD' format.
 
     Raises ValueError with a human-readable message on invalid input.
     """
-    text = raw_input.strip().lower()
-
-    year = None
-    month = None
-
-    # Format: YYYY-MM
-    m = re.match(r'^(\d{4})-(\d{1,2})$', text)
-    if m:
-        year, month = int(m.group(1)), int(m.group(2))
-
-    # Format: "<month name> YYYY"
-    if year is None:
-        m = re.match(r'^([a-zA-Z]+)\s+(\d{4})$', text)
-        if m and m.group(1) in MONTH_NAMES:
-            month = MONTH_NAMES[m.group(1)]
-            year = int(m.group(2))
-
-    # Format: MM-YYYY or MM/YYYY
-    if year is None:
-        m = re.match(r'^(\d{1,2})[-/](\d{4})$', text)
-        if m:
-            month, year = int(m.group(1)), int(m.group(2))
-
-    if year is None or month is None:
+    text = raw_input.strip()
+    try:
+        return datetime.strptime(text, DATE_INPUT_FORMAT)
+    except ValueError:
         raise ValueError(
-            "Could not understand the month/year. Try formats like "
-            "'January 2026' or '2026-01'."
+            f"Invalid date '{raw_input}'. Please use the format YYYY-MM-DD "
+            "(e.g. 2026-01-31)."
         )
 
-    if not (1 <= month <= 12):
-        raise ValueError(f"Month must be between 1 and 12 (got {month}).")
 
-    if not (1900 <= year <= 2100):
-        raise ValueError(f"Year looks out of range (got {year}).")
-
-    start_dt = datetime(year, month, 1)
-    if month == 12:
-        end_dt = datetime(year + 1, 1, 1)
-    else:
-        end_dt = datetime(year, month + 1, 1)
-
-    label = f"{calendar.month_name[month]} {year}"
-    start_str = start_dt.strftime("%Y-%m-%d 00:00:00.000")
-    end_str = end_dt.strftime("%Y-%m-%d 00:00:00.000")
-
-    return label, start_str, end_str
-
-
-def prompt_for_month():
+def prompt_for_date(label: str) -> datetime:
     """
-    Repeatedly prompts the user for a target month/year until a valid
-    value is entered. Returns (label, start_date, end_date).
+    Repeatedly prompts the user for a date until a valid YYYY-MM-DD value
+    is entered. Returns the parsed datetime.
     """
-    print("\nEnter the target month and year (e.g. 'January 2026' or '2026-01'): ",
-          end="", flush=True)
+    print(f"\nEnter the {label} date (format: YYYY-MM-DD): ", end="", flush=True)
     while True:
         try:
             raw = input().strip()
@@ -155,18 +87,51 @@ def prompt_for_month():
             raise SystemExit("\nInput interrupted. Exiting.")
 
         try:
-            return parse_month_input(raw)
+            return parse_date_input(raw)
         except ValueError as e:
             print(f"  [INVALID] {e}")
-            print("  Please re-enter (e.g. 'January 2026' or '2026-01'): ",
+            print(f"  Please re-enter the {label} date (YYYY-MM-DD): ",
                   end="", flush=True)
+
+
+def prompt_for_date_range() -> Tuple[str, str, str]:
+    """
+    Prompts for a start date and an end date, validates that start <= end,
+    and returns (label, start_date_sql, end_date_sql) where the SQL strings
+    form a half-open range: start 00:00:00.000  <=  UploadDate  <  (end + 1 day) 00:00:00.000
+
+    Using a half-open range (>= start AND < end_exclusive) keeps the
+    predicate sargable (index-seek friendly) instead of using a closed
+    range with 23:59:59.999, which is functionally equivalent here since
+    UploadDate has no sub-millisecond precision concerns.
+    """
+    while True:
+        start_dt = prompt_for_date("start")
+        end_dt = prompt_for_date("end")
+
+        if start_dt > end_dt:
+            print("  [INVALID] Start date cannot be greater than end date. "
+                  "Please re-enter both dates.")
+            continue
+
+        break
+
+    # Half-open upper bound: the day after the given end date at midnight.
+    end_exclusive_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_exclusive_dt = datetime.fromordinal(end_exclusive_dt.toordinal() + 1)
+
+    label = f"{start_dt.strftime(DATE_INPUT_FORMAT)} to {end_dt.strftime(DATE_INPUT_FORMAT)}"
+    start_str = start_dt.strftime("%Y-%m-%d 00:00:00.000")
+    end_str = end_exclusive_dt.strftime("%Y-%m-%d 00:00:00.000")
+
+    return label, start_str, end_str
 
 
 # ═══════════════════════════════════════════════════════════════
 #  DATABASE UTILITIES
 # ═══════════════════════════════════════════════════════════════
 
-def connect_to_db():
+def connect_to_db() -> Optional[pyodbc.Connection]:
     """Establishes a connection to the SQL Server database."""
     try:
         driver = "{ODBC Driver 18 for SQL Server}"
@@ -187,7 +152,7 @@ def connect_to_db():
         return None
 
 
-def _rows_to_dicts(cursor, rows):
+def _rows_to_dicts(cursor: "pyodbc.Cursor", rows: List[Any]) -> List[Dict[str, Any]]:
     """Helper – convert pyodbc rows to a list of dicts."""
     if not rows:
         return []
@@ -195,7 +160,9 @@ def _rows_to_dicts(cursor, rows):
     return [dict(zip(columns, row)) for row in rows]
 
 
-def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
+def fetch_eligible_records_for_range(
+    cursor: "pyodbc.Cursor", label: str, start_date: str, end_date: str
+) -> List[Dict[str, Any]]:
     """
     Fetches records where d.UploadDate falls within [start_date, end_date)
     AND ed.processingStatus IN ('Not Applicable', 'Aadhaar Not Found').
@@ -243,18 +210,22 @@ def fetch_eligible_records_for_month(cursor, label, start_date, end_date):
               f"joined via documents -> files -> extractionDetails).")
         return result
     except pyodbc.Error as ex:
-        print(f"  [DB ERROR] fetch_eligible_records_for_month({label}): {ex}")
+        print(f"  [DB ERROR] fetch_eligible_records_for_range({label}): {ex}")
         return []
 
 
-def split_records_by_status(records):
+def split_records_by_status(
+    records: List[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
     """
     Splits a combined list of records into a dict keyed by processingStatus,
     e.g. {"Not Applicable": [...], "Aadhaar Not Found": [...]}.
     Any status outside TARGET_PROCESSING_STATUSES is ignored (should not
     occur given the query filter, but guards against unexpected data).
     """
-    grouped = {status: [] for status in TARGET_PROCESSING_STATUSES}
+    grouped: Dict[str, List[Dict[str, Any]]] = {
+        status: [] for status in TARGET_PROCESSING_STATUSES
+    }
     for record in records:
         status = record.get("processingStatus")
         if status in grouped:
@@ -267,15 +238,15 @@ def split_records_by_status(records):
 # ═══════════════════════════════════════════════════════════════
 
 # Only these four extraction paths are targeted for deletion / size calc.
-EXTRACTION_PATH_FIELDS = [
-    ("extractedFilePath",    "extracted file"),
-    ("pickleInputPath",      "pickle input file"),
-    ("pickleOutputPath",     "pickle output file"),
+EXTRACTION_PATH_FIELDS: List[Tuple[str, str]] = [
+    ("extractedFilePath", "extracted file"),
+    ("pickleInputPath", "pickle input file"),
+    ("pickleOutputPath", "pickle output file"),
     ("outputFilePrepration", "output file prepration"),
 ]
 
 
-def get_extraction_paths(record):
+def get_extraction_paths(record: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Returns [(abs_path, description), …] for a single record."""
     results = []
     for field, desc in EXTRACTION_PATH_FIELDS:
@@ -289,15 +260,17 @@ def get_extraction_paths(record):
 #  STORAGE CALCULATION
 # ═══════════════════════════════════════════════════════════════
 
-def calculate_storage_for_records(records):
+def calculate_storage_for_records(
+    records: List[Dict[str, Any]]
+) -> Tuple[Set[str], int, int]:
     """
     Scans all extraction file paths in `records`, de-duplicating physical
     paths so the same file is never counted twice.
 
     Returns: (unique_existing_paths: set, total_bytes: int, missing_count: int)
     """
-    seen_paths    = set()
-    total_bytes   = 0
+    seen_paths: Set[str] = set()
+    total_bytes = 0
     missing_count = 0
 
     for record in records:
@@ -322,11 +295,17 @@ def calculate_storage_for_records(records):
 #  REPORTING
 # ═══════════════════════════════════════════════════════════════
 
-def print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, overall_stats):
+def print_pre_deletion_summary(
+    range_label: str,
+    disk_before: Dict[str, float],
+    na_stats: Dict[str, Any],
+    anf_stats: Dict[str, Any],
+    overall_stats: Dict[str, Any],
+) -> None:
     """
     Prints the combined pre-deletion summary ONCE: current server storage,
-    selected month, per-status breakdown (Not Applicable / Aadhaar Not Found),
-    and an overall total.
+    selected date range, per-status breakdown (Not Applicable / Aadhaar Not
+    Found), and an overall total.
 
     na_stats / anf_stats / overall_stats are dicts with keys:
         record_count, existing_paths, total_bytes, missing_count
@@ -339,7 +318,7 @@ def print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, ov
     print(f"Free Storage       : {disk_before['free_gb']:.2f} GB")
     print(f"Used Percentage    : {disk_before['used_pct']:.2f} %")
 
-    print(f"\nSelected Month     : {month_label}")
+    print(f"\nSelected Range     : {range_label}")
 
     print("\nNot Applicable")
     print("-" * 26)
@@ -362,33 +341,35 @@ def print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, ov
 #  FILE DELETION
 # ═══════════════════════════════════════════════════════════════
 
-def delete_file_from_system(abs_path, description="file"):
+def delete_file_from_system(
+    abs_path: str, description: str = "file"
+) -> Tuple[bool, str, int]:
     """
     Deletes a single file.  abs_path must already be an absolute path.
 
     Returns: (success: bool, status: str, size_bytes: int)
     status ∈ {"deleted", "not_found", "not_a_file", "error"}
     """
-    if os.path.exists(abs_path):
-        if os.path.isfile(abs_path):
-            try:
-                size_bytes = os.path.getsize(abs_path)
-                os.remove(abs_path)
-                print(f"    [DELETED] {description}: {abs_path}  "
-                      f"({bytes_to_gb(size_bytes):.6f} GB)")
-                return True, "deleted", size_bytes
-            except OSError as e:
-                print(f"    [ERROR] Cannot delete {abs_path}: {e}")
-                return False, "error", 0
-        else:
-            print(f"    [SKIP] Not a file (directory?): {abs_path}")
-            return False, "not_a_file", 0
-    else:
+    if not os.path.exists(abs_path):
         print(f"    [NOT FOUND] {abs_path}")
         return False, "not_found", 0
 
+    if not os.path.isfile(abs_path):
+        print(f"    [SKIP] Not a file (directory?): {abs_path}")
+        return False, "not_a_file", 0
 
-def perform_cleanup(records):
+    try:
+        size_bytes = os.path.getsize(abs_path)
+        os.remove(abs_path)
+        print(f"    [DELETED] {description}: {abs_path}  "
+              f"({bytes_to_gb(size_bytes):.6f} GB)")
+        return True, "deleted", size_bytes
+    except OSError as e:
+        print(f"    [ERROR] Cannot delete {abs_path}: {e}")
+        return False, "error", 0
+
+
+def perform_cleanup(records: List[Dict[str, Any]]) -> Dict[str, int]:
     """
     Deletes every extraction file referenced across `records`,
     de-duplicating so the same physical path is never touched twice.
@@ -398,29 +379,29 @@ def perform_cleanup(records):
     Returns a stats dict.
     """
     stats = {
-        "deleted":       0,
-        "not_found":     0,
-        "errors":        0,
+        "deleted": 0,
+        "not_found": 0,
+        "errors": 0,
         "deleted_bytes": 0,
     }
-    deleted_paths = set()
+    deleted_paths: Set[str] = set()
 
     print(f"\n--- Starting Deletion: {len(records)} eligible record(s) "
           f"(processingStatus IN {TARGET_PROCESSING_STATUSES}) ---")
 
     for record in records:
-        file_id   = record.get("file_id")
+        file_id = record.get("file_id")
         file_name = record.get("file_name")
         print(f"\n  FileID: {file_id}  |  {file_name}")
 
         for abs_path, description in get_extraction_paths(record):
             if abs_path in deleted_paths:
-                continue   # already deleted in this run
+                continue  # already deleted in this run
 
             success, status, size_bytes = delete_file_from_system(abs_path, description)
 
             if success:
-                stats["deleted"]       += 1
+                stats["deleted"] += 1
                 stats["deleted_bytes"] += size_bytes
                 deleted_paths.add(abs_path)
             elif status == "not_found":
@@ -436,7 +417,7 @@ def perform_cleanup(records):
 #  USER CONFIRMATION
 # ═══════════════════════════════════════════════════════════════
 
-def prompt_user_confirmation():
+def prompt_user_confirmation() -> bool:
     """
     Asks the user whether to delete files belonging to both eligible
     ProcessingStatus values. Returns True only on explicit 'yes'.
@@ -461,7 +442,13 @@ def prompt_user_confirmation():
 #  FINAL REPORT
 # ═══════════════════════════════════════════════════════════════
 
-def print_final_report(month_label, records_processed, stats, disk_before, disk_after):
+def print_final_report(
+    range_label: str,
+    records_processed: int,
+    stats: Dict[str, int],
+    disk_before: Dict[str, float],
+    disk_after: Dict[str, float],
+) -> None:
     """Prints the post-cleanup summary, including net space reclaimed."""
     deleted_gb = bytes_to_gb(stats["deleted_bytes"])
     net_reclaimed_gb = disk_after["free_gb"] - disk_before["free_gb"]
@@ -469,7 +456,7 @@ def print_final_report(month_label, records_processed, stats, disk_before, disk_
     print("\n" + "=" * 52)
     print("  CLEANUP COMPLETED")
     print("=" * 52)
-    print(f"  Selected Month       : {month_label}")
+    print(f"  Selected Range       : {range_label}")
     print(f"  Processing Statuses  : {', '.join(TARGET_PROCESSING_STATUSES)}")
     print(f"\n  Records Processed    : {records_processed}")
     print(f"  Files Deleted        : {stats['deleted']}")
@@ -499,15 +486,15 @@ def print_final_report(month_label, records_processed, stats, disk_before, disk_
 #  MAIN
 # ═══════════════════════════════════════════════════════════════
 
-def main():
+def main() -> None:
     """Main orchestration for the Aadhaar storage cleanup process."""
 
     # ── Step 1 : Disk usage snapshot (not printed here — it is shown
     #            once as part of the pre-deletion summary below) ────
     disk_before = get_disk_usage(DATA_ROOT_PATH)
 
-    # ── Step 2 : Prompt for target month ───────────────────────
-    month_label, start_date, end_date = prompt_for_month()
+    # ── Step 2 : Prompt for target date range ──────────────────
+    range_label, start_date, end_date = prompt_for_date_range()
 
     # ── Step 3 : Connect to DB ──────────────────────────────────
     print(f"\n[INFO] Fetching from DB: {DATABASE}")
@@ -515,20 +502,20 @@ def main():
     if not conn:
         return
 
-    cursor = None
+    cursor: Optional["pyodbc.Cursor"] = None
     try:
         cursor = conn.cursor()
 
-        # ── Step 4 : Fetch eligible records for selected month ──
-        print(f"\n[INFO] Querying database for records in {month_label} "
+        # ── Step 4 : Fetch eligible records for selected range ──
+        print(f"\n[INFO] Querying database for records in {range_label} "
               f"with processingStatus IN {TARGET_PROCESSING_STATUSES}...")
-        eligible_records = fetch_eligible_records_for_month(
-            cursor, month_label, start_date, end_date
+        eligible_records = fetch_eligible_records_for_range(
+            cursor, range_label, start_date, end_date
         )
 
         # ── Step 5 : Split by status & calculate storage per status ──
         records_by_status = split_records_by_status(eligible_records)
-        na_records  = records_by_status["Not Applicable"]
+        na_records = records_by_status["Not Applicable"]
         anf_records = records_by_status["Aadhaar Not Found"]
 
         na_existing, na_bytes, na_missing = calculate_storage_for_records(na_records)
@@ -538,31 +525,31 @@ def main():
         )
 
         na_stats = {
-            "record_count":   len(na_records),
+            "record_count": len(na_records),
             "existing_paths": na_existing,
-            "total_bytes":    na_bytes,
-            "missing_count":  na_missing,
+            "total_bytes": na_bytes,
+            "missing_count": na_missing,
         }
         anf_stats = {
-            "record_count":   len(anf_records),
+            "record_count": len(anf_records),
             "existing_paths": anf_existing,
-            "total_bytes":    anf_bytes,
-            "missing_count":  anf_missing,
+            "total_bytes": anf_bytes,
+            "missing_count": anf_missing,
         }
         overall_stats = {
-            "record_count":   len(eligible_records),
+            "record_count": len(eligible_records),
             "existing_paths": overall_existing,
-            "total_bytes":    overall_bytes,
-            "missing_count":  overall_missing,
+            "total_bytes": overall_bytes,
+            "missing_count": overall_missing,
         }
 
         # ── Step 6 : Pre-deletion summary (shown only once) ───
-        print_pre_deletion_summary(month_label, disk_before, na_stats, anf_stats, overall_stats)
+        print_pre_deletion_summary(range_label, disk_before, na_stats, anf_stats, overall_stats)
 
         # ── Step 7 : Check if there are eligible records ───────
         if not eligible_records:
             print(f"\n[INFO] No records with processingStatus IN "
-                  f"{TARGET_PROCESSING_STATUSES} found for this month. Exiting.")
+                  f"{TARGET_PROCESSING_STATUSES} found for this range. Exiting.")
             return
 
         # ── Step 8 : User confirmation ─────────────────────────
@@ -576,7 +563,7 @@ def main():
         # ── Step 10 : Final report ──────────────────────────────
         disk_after = get_disk_usage(DATA_ROOT_PATH)
         print_final_report(
-            month_label=month_label,
+            range_label=range_label,
             records_processed=len(eligible_records),
             stats=stats,
             disk_before=disk_before,
